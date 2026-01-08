@@ -1,30 +1,30 @@
-# Plan d'implémentation : Assistant Vocal Windows avec Gemini
+# Implementation Plan: Gemini Windows Voice Assistant
 
-Ce projet vise à créer un assistant Windows invisible qui écoute une commande vocale via un raccourci clavier ("Push-to-Talk"), traite l'audio avec Gemini, et tape le résultat directement dans l'application active.
+This project aims to create an invisible Windows assistant that listens for voice commands via a keyboard shortcut ("Push-to-Talk"), processes the audio with Gemini, and types the result directly into the active application.
 
 ## Architecture
 
-1.  **Entrée Audio (Recorder)** :
-    *   Utilise `sounddevice` pour capturer le microphone.
-    *   Enregistre tant que le raccourci est maintenu.
-    *   Sauvegarde temporaire en fichier `.wav` (requis pour l'API Gemini).
+1.  **Audio Input (Recorder)**:
+    *   Uses `sounddevice` to capture microphone input.
+    *   Records as long as the shortcut is held down.
+    *   Temporarily saves as a `.wav` file (required for the Gemini API).
 
-2.  **Traitement IA (Gemini Client)** :
-    *   Envoie le fichier audio à l'API Gemini (Flash ou Pro).
-    *   **System Instruction (SI)** : "Tu es un assistant de rédaction. L'utilisateur va te dicter une commande ou un texte. Exécute la demande et retourne *uniquement* le texte résultat prêt à être envoyé. Pas de blabla, pas de guillemets, pas de préambule."
+2.  **AI Processing (Gemini Client)**:
+    *   Sends the audio file to the Gemini API (Flash-Lite).
+    *   **System Instruction (SI)**: "You are an editorial assistant. The user will dictate a command or text. Execute the request and return *only* the resulting text ready to be sent. No filler, no quotes, no preamble."
 
-3.  **Interaction Système (Controller)** :
-    *   Utilise la librairie `keyboard` pour détecter l'appui long sur le raccourci (ex: `F8` ou `Ctrl+Space`).
-    *   Utilise `keyboard.write()` ou `pyperclip` + `Ctrl+V` pour insérer le texte généré.
+3.  **System Interaction (Controller)**:
+    *   Uses the `keyboard` library to detect long presses on the shortcut (e.g., `F8` or `Ctrl+Space`).
+    *   Uses `keyboard.write()` or `pyperclip` + `Ctrl+V` to insert the generated text.
 
-4.  **Contexte Visuel (Context Provider)** :
-    *   **Capture d'écran** : Utilise `Pillow` / `pyautogui` pour capturer l'écran au moment de l'activation.
-    *   **Mise en évidence** : Dessine un cercle ou un indicateur autour de la position de la souris sur l'image.
-    *   **Métadonnées** : Récupère le titre de la fenêtre active via `pygetwindow` pour donner du contexte à Gemini (ex: "Je suis dans VS Code").
+4.  **Visual Context (Context Provider)**:
+    *   **Screenshot**: Uses `Pillow` / `pyautogui` to capture the screen at the moment of activation.
+    *   **Highlighting**: Draws a circle or indicator around the mouse position on the image.
+    *   **Metadata**: Retrieves the active window title via `pygetwindow` to provide context to Gemini (e.g., "I am in VS Code").
 
-## Étapes de développement
+## Development Steps
 
-1.  **Configuration de l'environnement** : Création du `requirements.txt`.
-2.  **Module d'enregistrement** : Script pour capturer l'audio vers un fichier WAV.
-3.  **Module Gemini** : Script pour envoyer l'audio et récupérer le texte.
-4.  **Main Application** : Boucle principale écoutant le clavier et orchestrant les appels.
+1.  **Environment Setup**: Creation of `requirements.txt`.
+2.  **Recording Module**: Script to capture audio to a WAV file.
+3.  **Gemini Module**: Script to send audio and retrieve text.
+4.  **Main Application**: Main loop listening to the keyboard and orchestrating calls, including System Tray integration.
