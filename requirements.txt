@@ -1,0 +1,10 @@
+google-genai
+sounddevice
+numpy
+scipy
+keyboard
+pyperclip
+python-dotenv
+Pillow
+pyautogui
+pygetwindow
