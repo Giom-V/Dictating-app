@@ -9,6 +9,8 @@ A powerful, invisible AI assistant for Windows that allows you to dictate text a
 *   🧠 **Smart AI**: Uses `gemini-2.5-flash-lite` for ultra-low latency and high intelligence.
 *   ⚡ **Direct Injection**: The generated text is automatically typed/pasted into your active application.
 *   🌍 **Multilingual**: Dictate in any language, or ask for translations on the fly.
+*   🖥️ **System Tray Integration**: Runs quietly in the background with a handy system tray icon.
+*   🚀 **Auto-Start**: Right-click the icon to enable "Start with Windows" so it's always ready.
 
 ## Prerequisites
 
@@ -47,13 +49,17 @@ A powerful, invisible AI assistant for Windows that allows you to dictate text a
     ```bash
     python main.py
     ```
-2.  Go to any application (Notepad, VS Code, Slack, Browser...).
-3.  **Hold down** the configured hotkey (e.g., `F8`).
-4.  **Speak** your command or text while holding the key.
-    *   *Example:* "Explain this function" (while pointing at code).
-    *   *Example:* "Write a reply saying I'm interested" (while looking at an email).
-5.  **Release** the key.
-6.  Watch the magic happen! 🪄
+    *The application will start in the background. Look for the blue microphone icon in your system tray (bottom right).*
+
+2.  **Right-click** the tray icon to:
+    *   Enable **"Start with Windows"**.
+    *   **Quit** the application.
+
+3.  To use the agent:
+    *   Go to any application (Notepad, VS Code, Slack...).
+    *   **Hold down** the configured hotkey (e.g., `F8`).
+    *   **Speak** your command.
+    *   **Release** the key.
 
 ## Troubleshooting
 
