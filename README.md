@@ -39,6 +39,7 @@ A powerful, invisible AI assistant for Windows that allows you to dictate text a
     ```
 2.  **GEMINI_API_KEY**: Paste your API key from Google AI Studio.
 3.  **HOTKEY**: Choose your push-to-talk key (e.g., `F8`, `ctrl+space`, `alt+k`).
+4.  **System Instructions**: You can modify the bot's behavior by editing the `system_instruction.txt` file.
 
 ## Usage
 

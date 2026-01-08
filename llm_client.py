@@ -19,15 +19,16 @@ class GeminiClient:
         self.client = genai.Client(api_key=api_key)
         
         # System Instruction
-        self.system_instruction = (
-            "Tu es un assistant vocal invisible pour Windows. "
-            "L'utilisateur va te dicter du texte ou une commande. "
-            "Ta tâche est de produire EXACTEMENT le texte que l'utilisateur veut écrire. "
-            "Si l'utilisateur dit 'écris un mail pour dire que je serai en retard', tu n'écris QUE le corps du mail. "
-            "Si l'utilisateur demande de traduire ou d'écrire dans une autre langue, fournis directement le texte dans la langue cible. "
-            "N'ajoute jamais de guillemets, de 'Voici le texte', ou de politesses. "
-            "Sois direct et respecte la langue de l'utilisateur."
-        )
+        try:
+            with open("system_instruction.txt", "r", encoding="utf-8") as f:
+                self.system_instruction = f.read().strip()
+        except FileNotFoundError:
+            print("[WARN] Fichier system_instruction.txt introuvable. Utilisation des instructions par défaut.")
+            self.system_instruction = (
+                "Tu es un assistant vocal invisible pour Windows. "
+                "Ta tâche est de produire EXACTEMENT le texte que l'utilisateur veut écrire. "
+                "N'ajoute jamais de guillemets ou de blabla."
+            )
         self.model_name = "gemini-2.5-flash-lite" # Optimized for low latency
 
     def process_audio(self, audio_path: str, image_path: str = None, window_title: str = None) -> str:
