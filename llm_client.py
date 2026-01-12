@@ -1,6 +1,7 @@
 from google import genai
 from google.genai import types
 import os
+import json
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
@@ -165,9 +166,20 @@ class GeminiClient:
             "1. **Analyse Visuelle** : Regarde sous le curseur rouge. Quelle est l'app ? Quel est le ton ?"
             "2. **Analyse Audio** : Que veut l'utilisateur ?"
             "3. **Stratégie** : Détermine la langue, le ton (Pro/Perso), et les points clés."
+            "\n4. **ROUTING (CRITIQUE)** : Evalue la complexité."
+            "   - 'COMPLEX' : Code, Raisonnement logique complexe, Créativité longue, ou demande explicite de 'Pro'."
+            "   - 'SIMPLE' : Email rapide, chat, correction, courte phrase."
             "\nSORTIE ATTENDUE :"
-            "Produis une analyse concise résumant : Contexte, Langue à utiliser, Ton visé, et Contenu à générer."
-            "NE GÉNÈRE PAS LE TEXTE FINAL MAINTENANT."
+            "Tu dois répondre UNIQUEMENT en JSON avec la structure suivante :"
+            "{"
+            "  \"context_analysis\": \"Analyse visuelle et contextuelle\","
+            "  \"intent\": \"Ce que veut l'utilisateur\","
+            "  \"language\": \"Langue détectée (ex: 'fr', 'en')\","
+            "  \"tone\": \"Ton suggéré\","
+            "  \"complexity\": \"SIMPLE\" OU \"COMPLEX\","
+            "  \"model_reasoning\": \"Pourquoi c'est simple ou complexe\","
+            "  \"step_by_step_plan\": \"Plan de rédaction\""
+            "}"
         )
         
         contents_step1 = []
@@ -202,11 +214,20 @@ class GeminiClient:
                 contents=contents_step1,
                 config=types.GenerateContentConfig(
                     system_instruction=analysis_system_instruction,
-                    temperature=0.7
+                    temperature=0.7,
+                    response_mime_type="application/json"
                 )
             )
-            analysis_result = response_1.text.strip() if response_1.text else ""
-            print(f"[STEP 1 ANALYSIS]:\n{analysis_result}\n")
+            analysis_text = response_1.text.strip() if response_1.text else "{}"
+            print(f"[STEP 1 RAW JSON]:\n{analysis_text}\n")
+            
+            # Parse JSON
+            try:
+                analysis_json = json.loads(analysis_text)
+            except json.JSONDecodeError:
+                print("[WARN] JSON Parsing failed, falling back to simple text analysis.")
+                analysis_json = {"complexity": "SIMPLE", "context_analysis": analysis_text}
+
         except Exception as e:
             print(f"[ERROR] Step 1 failed: {e}")
             return ""
@@ -224,16 +245,30 @@ class GeminiClient:
         )
         
         contents_step2 = []
-        prompt_text_2 = f"Voici l'ANALYSE de la situation :\n{analysis_result}\n\nInstructions: Rédige maintenant le texte final."
+        # Create a nice summary for the drafter
+        prompt_text_2 = (
+            f"CONTEXTE ANALYSÉ :\n{json.dumps(analysis_json, indent=2, ensure_ascii=False)}\n\n"
+            "Instructions: Rédige maintenant le texte final en suivant STRICTEMENT ce plan."
+        )
         
         contents_step2.append(prompt_text_2)
         # We include the image again for visual context/grounding in the drafting phase if available
         if img_part: 
             contents_step2.append(img_part)
         
+        # Determine Model for Step 2
+        step2_model = self.model_name # Default to Lite
+        complexity = analysis_json.get("complexity", "SIMPLE").upper()
+        
+        if complexity == "COMPLEX":
+            step2_model = "gemini-3-pro-preview"
+            print(f"[ROUTING] Task judged COMPLEX ({analysis_json.get('model_reasoning')}). Switching to {step2_model}.")
+        else:
+            print(f"[ROUTING] Task judged SIMPLE. Staying on {step2_model}.")
+
         try:
             response_2 = self.client.models.generate_content(
-                model=self.model_name,
+                model=step2_model,
                 contents=contents_step2,
                 config=types.GenerateContentConfig(
                     system_instruction=drafting_system_instruction,

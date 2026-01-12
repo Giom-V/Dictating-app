@@ -69,11 +69,15 @@ A powerful, invisible AI assistant for Windows that allows you to dictate text a
         *   **Behavior**: Types exactly what you say. Follows formatting instructions immediately (e.g., "Write in English" -> Writes inside the document in English).
 
     *   🧠 **Thinking Mode** (`F9`):
-        *   **Action**: Hold `F9`, point your cursor at something, and ask a question.
-        *   **Goal**: Contextual assistance (Code analysis, Reply to email, Chat).
-        *   **Behavior**: Analyze the element **under your cursor**, detects the language/context, and answers helpfully.
-        *   *Example*: Point at a function -> "Refactor this to be async".
-        *   *Example*: Point at an email reply -> "Say I'm available on Tuesday".
+        *   **Action**: Hold `F9`, point your cursor at something, and ask.
+        *   **Goal**: Smart Assistant (Code generation, Email replies, complex analysis).
+        *   **Behavior (2-Step Process)**:
+            1.  **Analysis**: Scans screen/audio, determines language/context, and **routes** the request.
+            2.  **Drafting**: Generates the final text.
+                *   *Simple Task* -> Uses **Flash Lite** (Fast).
+                *   *Complex Task* (Code/Pro) -> Uses **Gemini Pro** (Powerful).
+        *   *Example*: Point at code -> "Optimise ça en Python" (Uses Pro).
+        *   *Example*: Point at email -> "Réponds gentiment" (Uses Lite).
 
     *   🐞 **Debug Mode** (`Ctrl` + `F9`):
         *   **Action**: Press `Ctrl+F9` (No need to hold/speak).
