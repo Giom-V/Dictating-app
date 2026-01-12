@@ -33,6 +33,9 @@ class GeminiClient:
 
     def process_audio(self, audio_path: str, image_path: str = None, window_title: str = None, mode: str = "dictation") -> str:
         """Uploads audio/image bytes and gets the response text."""
+        if mode == "thinking":
+            return self._process_thinking_mode(audio_path, image_path, window_title)
+
         print(f"Envoi des données à Gemini... (Mode: {mode}, Audio: {audio_path}, Image: {image_path})")
         
         contents = []
@@ -147,3 +150,101 @@ class GeminiClient:
             if "API key expired" in str(e):
                  print("!!! VOTRE CLÉ API EST EXPIRÉE OU INVALIDE. VEUILLEZ VÉRIFIER LE FICHIER .ENV !!!")
             raise e
+
+    def _process_thinking_mode(self, audio_path: str, image_path: str, window_title: str) -> str:
+        """Executes the two-step thinking process: Analysis -> Drafting."""
+        print("\n=== [THINKING MODE STARTED] ===")
+        
+        # --- STEP 1: ANALYSIS ---
+        print(">> STEP 1: ANALYZING CONTEXT & INTENT...")
+        
+        analysis_system_instruction = (
+            "Tu es un expert en analyse de contexte et communication. "
+            "Ta mission est d'analyser la situation (écran, audio) pour préparer la réponse parfaite."
+            "\nNAVIGATEUR :"
+            "1. **Analyse Visuelle** : Regarde sous le curseur rouge. Quelle est l'app ? Quel est le ton ?"
+            "2. **Analyse Audio** : Que veut l'utilisateur ?"
+            "3. **Stratégie** : Détermine la langue, le ton (Pro/Perso), et les points clés."
+            "\nSORTIE ATTENDUE :"
+            "Produis une analyse concise résumant : Contexte, Langue à utiliser, Ton visé, et Contenu à générer."
+            "NE GÉNÈRE PAS LE TEXTE FINAL MAINTENANT."
+        )
+        
+        contents_step1 = []
+        prompt_text_1 = "Instructions: Analyse tout (Audio + Image) et donne-moi le plan de rédaction."
+        
+        if window_title:
+            prompt_text_1 += f"\nContexte Fenêtre: '{window_title}'."
+        
+        contents_step1.append(prompt_text_1)
+        
+        # Helper to load files safely
+        img_part = None
+        if image_path and os.path.exists(image_path):
+            try:
+                with open(image_path, "rb") as f:
+                    img_part = types.Part.from_bytes(data=f.read(), mime_type="image/png")
+                    contents_step1.append(img_part)
+            except Exception as e:
+                print(f"[WARN] Failed to load image: {e}")
+
+        if audio_path and os.path.exists(audio_path):
+            try:
+                with open(audio_path, "rb") as f:
+                    audio_part = types.Part.from_bytes(data=f.read(), mime_type="audio/wav")
+                    contents_step1.append(audio_part)
+            except Exception as e:
+                 print(f"[WARN] Failed to load audio: {e}")
+
+        try:
+            response_1 = self.client.models.generate_content(
+                model=self.model_name,
+                contents=contents_step1,
+                config=types.GenerateContentConfig(
+                    system_instruction=analysis_system_instruction,
+                    temperature=0.7
+                )
+            )
+            analysis_result = response_1.text.strip() if response_1.text else ""
+            print(f"[STEP 1 ANALYSIS]:\n{analysis_result}\n")
+        except Exception as e:
+            print(f"[ERROR] Step 1 failed: {e}")
+            return ""
+
+        # --- STEP 2: DRAFTING ---
+        print(">> STEP 2: GENERATING FINAL TEXT...")
+        
+        drafting_system_instruction = (
+            "Tu es un rédacteur expert. "
+            "En te basant sur l'ANALYSE fournie et le contexte visuel, rédige le texte final."
+            "\nRÈGLES :"
+            "1. Respecte scrupuleusement le ton et la langue identifiés."
+            "2. Intègre-toi parfaitement au texte existant (sous le curseur)."
+            "3. SORTIE : UNIQUEMENT le texte à écrire. Pas de guillemets, pas de commentaires."
+        )
+        
+        contents_step2 = []
+        prompt_text_2 = f"Voici l'ANALYSE de la situation :\n{analysis_result}\n\nInstructions: Rédige maintenant le texte final."
+        
+        contents_step2.append(prompt_text_2)
+        # We include the image again for visual context/grounding in the drafting phase if available
+        if img_part: 
+            contents_step2.append(img_part)
+        
+        try:
+            response_2 = self.client.models.generate_content(
+                model=self.model_name,
+                contents=contents_step2,
+                config=types.GenerateContentConfig(
+                    system_instruction=drafting_system_instruction,
+                    temperature=0.7
+                )
+            )
+            final_text = response_2.text.strip() if response_2.text else ""
+            print(f"[STEP 2 OUTPUT]:\n{final_text}\n")
+            print("=== [THINKING MODE COMPLETE] ===")
+            return final_text
+            
+        except Exception as e:
+            print(f"[ERROR] Step 2 failed: {e}")
+            return ""
