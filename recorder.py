@@ -11,12 +11,56 @@ class AudioRecorder:
         self.recording = []
         self.stream = None
 
-    def start(self):
-        """Starts recording audio from the default microphone."""
+    def list_devices(self):
+        """Returns a filtered list of unique input devices (id, name)."""
+        devices = sd.query_devices()
+        input_devices = []
+        seen_names = set()
+        
+        # Common system-generated names to ignore (English/French/Generic)
+        ignored_names = [
+            "Microsoft Sound Mapper", "Mappeur de sons Microsoft",
+            "Primary Sound Capture Driver", "Pilote de capture audio principal",
+            "Stereo Mix", "Mixage stéréo"
+        ]
+
+        for i, dev in enumerate(devices):
+            name = dev['name']
+            if dev['max_input_channels'] > 0:
+                # 1. Ignore specific Windows system wrappers
+                is_ignored = False
+                for ignored in ignored_names:
+                    if name.startswith(ignored):
+                        is_ignored = True
+                        break
+                if is_ignored:
+                    continue
+                
+                # 2. Deduplicate names (keep first occurrence)
+                if name not in seen_names:
+                    input_devices.append((i, name))
+                    seen_names.add(name)
+        
+        return input_devices
+
+    def start(self, device_index=None):
+        """Starts recording audio from the specified or default microphone."""
         self.recording = [] # Reset recording
-        self.stream = sd.InputStream(samplerate=self.fs, channels=self.channels, callback=self._callback)
-        self.stream.start()
-        print("Enregistrement démarré...")
+        try:
+            self.stream = sd.InputStream(
+                device=device_index,
+                samplerate=self.fs, 
+                channels=self.channels, 
+                callback=self._callback
+            )
+            self.stream.start()
+            print(f"Enregistrement démarré (Device ID: {device_index})...")
+        except Exception as e:
+            print(f"[ERROR] Impossible de démarrer l'enregistrement sur le device {device_index}: {e}")
+            # Fallback to default if specific fails
+            if device_index is not None:
+                print("Tentative avec le périphérique par défaut...")
+                self.start(device_index=None)
 
     def stop(self) -> str:
         """Stops recording and saves to a temporary WAV file. Returns the file path."""

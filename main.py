@@ -7,6 +7,7 @@ import winreg
 from PIL import Image
 import pystray
 from pystray import MenuItem as item
+import json
 import pyperclip
 from dotenv import load_dotenv
 
@@ -27,6 +28,8 @@ class DictatingApp:
         self.recorder = None
         self.context_provider = None
         self.icon = None
+        self.current_mic_index = None
+        self.config_file = "config.json"
 
     def setup_components(self):
         try:
@@ -103,7 +106,7 @@ class DictatingApp:
                      continue # Loop back
 
                 # Start recording for Voice Modes
-                self.recorder.start()
+                self.recorder.start(device_index=self.current_mic_index)
 
                 # Wait for release of the specific key
                 # Note: For complex keys like ctrl+f9, simple wait might be tricky, but here we are in voice mode (F8/F9)
@@ -141,6 +144,37 @@ class DictatingApp:
         self.running = False
         icon.stop()
         sys.exit()
+
+    def load_config(self):
+        try:
+            with open(self.config_file, "r") as f:
+                return json.load(f)
+        except:
+            return {}
+
+    def save_config(self, key, value):
+        config = self.load_config()
+        config[key] = value
+        with open(self.config_file, "w") as f:
+            json.dump(config, f)
+
+    def set_mic(self, icon, item):
+        # Find device by name
+        devices = self.recorder.list_devices()
+        for idx, name in devices:
+            if name == item.text:
+                self.current_mic_index = idx
+                self.save_config("microphone", name)
+                print(f"[INFO] Microphone switched to: {name} (ID: {idx})")
+                break
+    
+    def is_mic_checked(self, item):
+        # Check if this item matches current config
+        config = self.load_config()
+        saved = config.get("microphone")
+        # If no config, maybe strictly check if it's default? 
+        # For now, let's just match name.
+        return item.text == saved
 
     def set_startup(self, enable=True):
         key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -196,8 +230,27 @@ class DictatingApp:
              # Create simple icon if not found
             image = Image.new('RGB', (64, 64), color = (73, 109, 137))
         
+        # Load config to find saved mic index
+        config = self.load_config()
+        saved_mic_name = config.get("microphone")
+        devices = self.recorder.list_devices()
+        
+        # Map saved name to current index
+        if saved_mic_name:
+            for idx, name in devices:
+                if name == saved_mic_name:
+                    self.current_mic_index = idx
+                    print(f"[INFO] Restored microphone: {name} (ID: {idx})")
+                    break
+        
+        # Build Mic Menu Items
+        mic_items = []
+        for idx, name in devices:
+            mic_items.append(item(name, self.set_mic, checked=self.is_mic_checked, radio=True))
+
         # Build menu
         menu = pystray.Menu(
+            item('Microphone', pystray.Menu(*mic_items)),
             item('Start with Windows', self.toggle_startup, checked=lambda item: self.is_startup_enabled()),
             item('Quit', self.on_quit)
         )
