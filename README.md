@@ -55,11 +55,24 @@ A powerful, invisible AI assistant for Windows that allows you to dictate text a
     *   Enable **"Start with Windows"**.
     *   **Quit** the application.
 
-3.  To use the agent:
-    *   Go to any application (Notepad, VS Code, Slack...).
-    *   **Hold down** the configured hotkey (e.g., `F8`).
-    *   **Speak** your command.
-    *   **Release** the key.
+3.  **Using the Agent (3 Modes)**:
+
+    *   🎤 **Dictation Mode** (`F8`):
+        *   **Action**: Hold `F8` and speak.
+        *   **Goal**: Pure transcription.
+        *   **Behavior**: Types exactly what you say. Follows formatting instructions immediately (e.g., "Write in English" -> Writes inside the document in English).
+
+    *   🧠 **Thinking Mode** (`F9`):
+        *   **Action**: Hold `F9`, point your cursor at something, and ask a question.
+        *   **Goal**: Contextual assistance (Code analysis, Reply to email, Chat).
+        *   **Behavior**: Analyze the element **under your cursor**, detects the language/context, and answers helpfully.
+        *   *Example*: Point at a function -> "Refactor this to be async".
+        *   *Example*: Point at an email reply -> "Say I'm available on Tuesday".
+
+    *   🐞 **Debug Mode** (`Ctrl` + `F9`):
+        *   **Action**: Press `Ctrl+F9` (No need to hold/speak).
+        *   **Goal**: Diagnostic.
+        *   **Behavior**: Takes a screenshot and prints a detailed report in the **terminal** describing exactly what the agent sees under the red cursor. Use this if you feel the context is wrong.
 
 ## Troubleshooting
 
