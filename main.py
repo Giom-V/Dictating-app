@@ -120,9 +120,17 @@ class DictatingApp:
                     try:
                         text = self.client.process_audio(audio_path, image_path, window_title, mode=active_mode)
                         if text:
-                            pyperclip.copy(text)
-                            time.sleep(0.1)
-                            keyboard.send('ctrl+v')
+                            # Check for special Image Generation signal
+                            if text == "___IMAGE_GENERATED___":
+                                print("[INFO] Image generated. Triggering Paste...")
+                                # Image is already in clipboard via llm_client
+                                time.sleep(0.1)
+                                keyboard.send('ctrl+v')
+                            else:
+                                # Normal Text Flow
+                                pyperclip.copy(text)
+                                time.sleep(0.1)
+                                keyboard.send('ctrl+v')
                     except Exception as e:
                         print(f"[ERROR] processing: {e}")
                     
@@ -139,6 +147,12 @@ class DictatingApp:
             except Exception as e:
                 print(f"[ERROR] Loop error: {e}")
                 time.sleep(1)
+
+    def on_restart(self, icon, item):
+        print("[INFO] Restarting application...")
+        self.running = False
+        icon.stop()
+        os.execl(sys.executable, sys.executable, *sys.argv)
 
     def on_quit(self, icon, item):
         self.running = False
@@ -252,6 +266,7 @@ class DictatingApp:
         menu = pystray.Menu(
             item('Microphone', pystray.Menu(*mic_items)),
             item('Start with Windows', self.toggle_startup, checked=lambda item: self.is_startup_enabled()),
+            item('Restart', self.on_restart),
             item('Quit', self.on_quit)
         )
 

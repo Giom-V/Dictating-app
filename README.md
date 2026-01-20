@@ -53,6 +53,7 @@ A powerful, invisible AI assistant for Windows that allows you to dictate text a
 
 2.  **Right-click** the tray icon to:
     *   Enable **"Start with Windows"**.
+    *   **Restart** the application.
     *   **Quit** the application.
 
 3.  **Microphone Selection** 🎙️:
@@ -61,7 +62,10 @@ A powerful, invisible AI assistant for Windows that allows you to dictate text a
     *   Select your preferred input device from the list.
     *   *Usage Tip: If your webcam light turns on when using F8, try selecting a different microphone (like your headset) to avoid triggering the webcam's hardware activity LED.*
 
-4.  **Using the Agent (3 Modes)**:
+4.  **Configuration**:
+    *   **Thinking Mode Hotkey**: You can customize the thinking mode hotkey by adding `HOTKEY_THINKING` to your `.env` file (e.g., `HOTKEY_THINKING=F9`). The default is `F9`.
+
+5.  **Using the Agent (3 Modes)**:
 
     *   🎤 **Dictation Mode** (`F8`):
         *   **Action**: Hold `F8` and speak.
