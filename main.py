@@ -106,6 +106,7 @@ class DictatingApp:
                      continue # Loop back
 
                 # Start recording for Voice Modes
+                print(f"[MAIN] Starting recording on device index: {self.current_mic_index}")
                 self.recorder.start(device_index=self.current_mic_index)
 
                 # Wait for release of the specific key
@@ -113,12 +114,16 @@ class DictatingApp:
                 while self.running and keyboard.is_pressed(pressed_key):
                     time.sleep(0.05)
                 
-                print(f"[EVENT] Key released.")
+                print(f"[MAIN] Key {pressed_key} released. Stopping recorder...")
                 audio_path = self.recorder.stop()
+                print(f"[MAIN] Audio path received: {audio_path}")
                 
                 if audio_path:
                     try:
+                        print(f"[MAIN] Sending to LLM (Mode: {active_mode})...")
                         text = self.client.process_audio(audio_path, image_path, window_title, mode=active_mode)
+                        print(f"[MAIN] LLM returned text length: {len(text) if text else 0}")
+                        
                         if text:
                             # Check for special Image Generation signal
                             if text == "___IMAGE_GENERATED___":
@@ -131,15 +136,21 @@ class DictatingApp:
                                 pyperclip.copy(text)
                                 time.sleep(0.1)
                                 keyboard.send('ctrl+v')
+                                print("[MAIN] Text pasted.")
+                        else:
+                             print("[MAIN] LLM returned empty text.")
                     except Exception as e:
                         print(f"[ERROR] processing: {e}")
                     
                     # Cleanup
                     try:
-                        os.remove(audio_path)
+                        # DEBUG: Keep audio file for user verification
+                        # os.remove(audio_path)
                         if image_path and os.path.exists(image_path):
                             os.remove(image_path)
                     except: pass
+                else:
+                    print("[WARN] No audio recorded (file path is None). Mic issue?")
                 
                 # Prevent accidental re-trigger immediately after
                 time.sleep(0.5)

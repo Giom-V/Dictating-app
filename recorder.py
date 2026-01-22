@@ -69,13 +69,28 @@ class AudioRecorder:
             self.stream.close()
             self.stream = None
         
-        print("Enregistrement terminé.")
+        print("[RECORDER] Stopping stream...")
         
         if not self.recording:
+            print("[RECORDER] Warn: No data recorded (list is empty).")
             return None
 
         # Concatenate all blocks
-        myrecording = np.concatenate(self.recording, axis=0)
+        try:
+            myrecording = np.concatenate(self.recording, axis=0)
+        except ValueError:
+            print("[RECORDER] Error: Concatenation failed (empty chunks?)")
+            return None
+            
+        # Stats
+        total_samples = len(myrecording)
+        duration_sec = total_samples / self.fs
+        max_amp = np.max(np.abs(myrecording)) if total_samples > 0 else 0
+        
+        print(f"[RECORDER] Stats: Duration={duration_sec:.2f}s, Samples={total_samples}, MaxAmp={max_amp:.4f}")
+        
+        if max_amp < 0.001:
+            print("[RECORDER] WARNING: Audio is essentially SILENT.")
         
         # Convert to int16 to ensure standard PCM WAV format (more compatible)
         myrecording = (myrecording * 32767).astype(np.int16)
@@ -86,6 +101,9 @@ class AudioRecorder:
         
         # Save WAV
         wav.write(path, self.fs, myrecording)
+        file_size = os.path.getsize(path)
+        print(f"[RECORDER] File saved: {path} ({file_size} bytes)")
+        
         return path
 
     def _callback(self, indata, frames, time, status):
