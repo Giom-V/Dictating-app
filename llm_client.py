@@ -211,7 +211,7 @@ class GeminiClient:
                 "3. N'ajoute pas de guillemets au début ou à la fin.\n"
                 "4. Si l'utilisateur hésite (euh...), ignore les hésitations.\n"
                 "5. Le texte final doit être prêt à être collé."
-                "6. Je vais te fournir des captures d'écran pour t'aider à comprendre le contexte (quelle app est utilisée, dans quelle langue est la discussion actuelle, etc). C'est juste du contexte.\n"
+                "\n6. Je vais te fournir des captures d'écran pour t'aider à comprendre le contexte (quelle app est utilisée, dans quelle langue est la discussion actuelle, comment s'écrivent certains termes etc). C'est juste du contexte.\n"
                 "7. Ne recopie pas ce qui est dans la capture d'écran, c'est ce qui est dit à l'oral qui est important."
             )
             prompt_text = (
@@ -265,8 +265,6 @@ class GeminiClient:
                 config=types.GenerateContentConfig(
                     system_instruction=system_instruction,
                     temperature=0.0 if mode == "dictation" else 0.7, # Creative for thinking/debug, strict for dictation
-                    # Lower resolution for dictation to rely less on OCR details
-                    media_resolution=types.MediaResolution.MEDIA_RESOLUTION_LOW if mode == "dictation" else types.MediaResolution.MEDIA_RESOLUTION_HIGH
                 )
             )
             
