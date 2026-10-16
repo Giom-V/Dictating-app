@@ -1,465 +1,797 @@
+"""
+Gemini and Transcribe API client for Dictating-app.
+
+Handles audio transcription, multimodal context-aware dictation, Thinking Mode
+(`F9`), and Debug Mode (`Ctrl+F9`). Dynamically adapts request payloads,
+generation configs, and prompts based on the active model's family:
+- `transcribe` (`gemini-3.5-transcribe`): Audio-only payload with
+  `AudioTranscriptionConfig` (`SMART` or `VERBATIM` mode + contextual
+  `custom_vocabulary` extracted from the active window title).
+- `gemini_3_flash` (`gemini-3.5-flash-lite`, `gemini-3.1-flash-lite-preview`,
+  `gemini-3.5-flash`, `gemini-3-flash-preview`): Multimodal payload (audio +
+  cursor-highlighted screenshot) with XML-structured prompts and
+  `thinking_level="MINIMAL"`.
+- `gemini_2_5_flash` (`gemini-2.5-flash-lite`): Multimodal payload with strict
+  imperative anti-OCR guardrails.
+- `gemini_pro` (`gemini-3.1-pro-preview`, `gemini-3-pro-preview`): Multimodal
+  payload with semantic editing instructions and `thinking_level="LOW"`.
+"""
+
+import io
+import json
+import os
+import subprocess
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv() -> bool:  # type: ignore
+        return False
 from google import genai
 from google.genai import types
-import os
-import json
-import subprocess
-import tempfile
-import ctypes
-import time
-from io import BytesIO
 from PIL import Image
-from dotenv import load_dotenv
 
-load_dotenv(override=True)
+from config import (
+    DEFAULT_DICTATION_MODEL,
+    DEFAULT_IMAGE_MODEL,
+    DEFAULT_THINKING_MODEL,
+    DEFAULT_TRANSCRIBE_MODE,
+    FAMILY_TRANSCRIBE,
+    TRANSCRIBE_MODES,
+    get_model_family,
+    get_model_spec,
+    load_app_config,
+    model_supports_visual_context,
+)
+from logger_setup import log_llm_request, log_llm_response, setup_logging
+from prompts import (
+    build_debug_prompt,
+    build_dictation_prompts_by_family,
+    build_thinking_router_prompt,
+    build_transcribe_config_dict,
+    clean_transcription_output,
+)
+
+load_dotenv()
+logger = setup_logging()
+
+
+def extract_text_from_response(response: Any) -> str:
+    """Extract text from either `audio_transcription` parts or standard `text` parts.
+
+    `gemini-3.5-transcribe` returns its transcript inside
+    `candidate.content.parts[].audio_transcription.text` rather than `part.text`,
+    causing `response.text` to return `None` and emit a SDK warning. Inspecting
+    `parts` directly supports both ASR and standard Gemini LLMs without warnings.
+
+    Args:
+        response: `GenerateContentResponse` returned by `google-genai`.
+
+    Returns:
+        Concatenated transcript or text response string (empty string if none).
+    """
+    if response is None:
+        return ""
+
+    collected: List[str] = []
+    candidates = getattr(response, "candidates", None) or []
+    for candidate in candidates:
+        content = getattr(candidate, "content", None)
+        parts = getattr(content, "parts", None) or []
+        for part in parts:
+            # 1. Check `audio_transcription` (used by gemini-3.5-transcribe)
+            audio_trans = getattr(part, "audio_transcription", None)
+            if audio_trans is not None:
+                trans_text = getattr(audio_trans, "text", None)
+                if trans_text:
+                    collected.append(trans_text)
+                    continue
+
+            # 2. Check standard `text` part (skip internal thought parts if flagged)
+            if getattr(part, "thought", False):
+                continue
+            part_text = getattr(part, "text", None)
+            if part_text:
+                collected.append(part_text)
+
+    if collected:
+        return "".join(collected)
+
+    # Fallback for mock objects or non-standard responses
+    fallback_text = getattr(response, "text", None)
+    return fallback_text if isinstance(fallback_text, str) else ""
+
 
 class GeminiClient:
-    def __init__(self):
-        # Try to get from env, else fallback (dev mode)
-        api_key = os.getenv("GEMINI_API_KEY", "").strip()
-        
-        # Fallback if empty
+    """Client orchestrating Gemini Transcribe and Multimodal LLM calls."""
+
+    def __init__(
+        self,
+        model_name: Optional[str] = None,
+        transcribe_mode: Optional[str] = None,
+        config_data: Optional[Dict[str, Any]] = None,
+        dry_run: bool = False,
+    ) -> None:
+        """Initialize the Gemini API client and model configuration.
+
+        Args:
+            model_name: Optional override for the active dictation model ID.
+            transcribe_mode: Optional override for Transcribe mode ('SMART' or 'VERBATIM').
+            config_data: Optional pre-loaded configuration dictionary.
+            dry_run: When True, prevents clipboard/system mutations during tests.
+
+        Raises:
+            ValueError: If `GEMINI_API_KEY` is not set in the environment.
+        """
+        api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
-            raise ValueError("GEMINI_API_KEY introuvable dans l'env")
-        
-        print(f"[DEBUG] Using Key: {api_key[:5]}...{api_key[-4:]} (Length: {len(api_key)})")
+            raise ValueError("GEMINI_API_KEY not found in environment variables.")
 
         self.client = genai.Client(api_key=api_key)
-        
-        # System Instruction
-        try:
-            with open("system_instruction.txt", "r", encoding="utf-8") as f:
-                self.system_instruction = f.read().strip()
-        except FileNotFoundError:
-            print("[WARN] Fichier system_instruction.txt introuvable. Utilisation des instructions par défaut.")
-            self.system_instruction = (
-                "Tu es un assistant vocal invisible pour Windows. "
-                "Ta tâche est de produire EXACTEMENT le texte que l'utilisateur veut écrire. Il est très important de bien écouter l'utilisateur, les captures d'écran n'étant là que pour le contexte."
-                "N'ajoute jamais de guillemets ou de blabla. Fais bien attention à la ponctuation par contre."
-            )
-        self.model_name = "gemini-2.5-flash-lite" # Optimized for low latency
+        self.dry_run = dry_run
 
-    def _generate_with_retry(self, model_name, contents, config):
-        """
-        Wraps generate_content with retry logic (backoff 1s, 2s, 5s) 
-        and model fallback on 503 errors.
-        """
-        delays = [1, 2, 5]
-        
-        # Fallback map
-        fallback_models = {
-            "gemini-2.5-flash-lite": "gemini-3-flash-preview",
-            "gemini-3-pro-preview": "gemini-2.5-pro",
-        }
+        cfg = config_data if config_data is not None else load_app_config()
+        self.model_name: str = (
+            model_name or cfg.get("model_name") or DEFAULT_DICTATION_MODEL
+        ).strip()
+        self.transcribe_mode: str = (
+            transcribe_mode or cfg.get("transcribe_mode") or DEFAULT_TRANSCRIBE_MODE
+        ).upper()
+        if self.transcribe_mode not in TRANSCRIBE_MODES:
+            self.transcribe_mode = DEFAULT_TRANSCRIBE_MODE
 
-        current_model = model_name
-        
-        for attempt, delay in enumerate(delays + [None]): # None means last attempt or fallback
+        self.thinking_model: str = cfg.get("thinking_model") or DEFAULT_THINKING_MODEL
+        self.image_model: str = cfg.get("image_model") or DEFAULT_IMAGE_MODEL
+        self.custom_vocabulary: List[str] = list(cfg.get("custom_vocabulary") or [])
+        self.language_codes: List[str] = list(cfg.get("language_codes") or [])
+
+        logger.info(
+            "Initialized GeminiClient | model=%s | family=%s | transcribe_mode=%s | "
+            "thinking_model=%s | dry_run=%s",
+            self.model_name,
+            self.get_active_family(),
+            self.transcribe_mode,
+            self.thinking_model,
+            self.dry_run,
+        )
+
+    def get_active_family(self) -> str:
+        """Return the model family identifier for the currently selected model."""
+        return get_model_family(self.model_name)
+
+    def requires_visual_context(self, mode: str = "dictation") -> bool:
+        """Determine whether a screenshot should be captured for the given mode.
+
+        In standard `dictation` mode (`F8`), `transcribe`-family models
+        (`gemini-3.5-transcribe`) only accept audio input and reject images,
+        so skipping screenshot capture reduces latency and CPU usage.
+        In `thinking` (`F9`) and `debug` (`Ctrl+F9`) modes, visual context is
+        always captured.
+
+        Args:
+            mode: Operation mode ('dictation', 'thinking', or 'debug').
+
+        Returns:
+            True if a screenshot should be captured, False otherwise.
+        """
+        if mode in ("thinking", "debug"):
+            return True
+        return model_supports_visual_context(self.model_name)
+
+    def set_model(self, model_name: str) -> None:
+        """Switch the active dictation model at runtime.
+
+        Args:
+            model_name: Target Gemini or Transcribe model identifier.
+        """
+        cleaned = model_name.strip()
+        old_model = self.model_name
+        self.model_name = cleaned
+        logger.info(
+            "Switched dictation model: %s -> %s (family=%s)",
+            old_model,
+            self.model_name,
+            self.get_active_family(),
+        )
+
+    def set_transcribe_mode(self, mode: str) -> None:
+        """Switch the transcription mode ('SMART' or 'VERBATIM') for Transcribe models.
+
+        Args:
+            mode: Either 'SMART' or 'VERBATIM'.
+        """
+        normalized = mode.strip().upper()
+        if normalized not in TRANSCRIBE_MODES:
+            logger.warning("Ignored invalid transcribe_mode %r", mode)
+            return
+        old_mode = self.transcribe_mode
+        self.transcribe_mode = normalized
+        logger.info("Switched transcribe_mode: %s -> %s", old_mode, self.transcribe_mode)
+
+    def _generate_with_retry(
+        self,
+        model: str,
+        contents: List[Any],
+        config: Any = None,
+        retries: int = 3,
+        delay: float = 1.5,
+    ) -> Any:
+        """Call `client.models.generate_content` with exponential backoff on transient errors.
+
+        Args:
+            model: Target model identifier.
+            contents: List of `types.Part` and/or prompt strings.
+            config: `types.GenerateContentConfig` or dict.
+            retries: Maximum number of attempts.
+            delay: Base retry delay in seconds.
+
+        Returns:
+            `GenerateContentResponse` from the Gemini API.
+
+        Raises:
+            Exception: Re-raises the last exception if all retries fail or if the
+                error is a non-retryable client error.
+        """
+        for attempt in range(retries):
             try:
-                print(f"[DEBUG] Generating with {current_model} (Attempt {attempt + 1})")
-                response = self.client.models.generate_content(
-                    model=current_model,
-                    contents=contents,
-                    config=config
+                kwargs: Dict[str, Any] = {"model": model, "contents": contents}
+                if config is not None:
+                    kwargs["config"] = config
+                return self.client.models.generate_content(**kwargs)
+            except Exception as exc:
+                error_str = str(exc)
+                is_transient = any(
+                    code in error_str
+                    for code in ("503", "429", "500", "UNAVAILABLE", "RESOURCE_EXHAUSTED", "overloaded")
                 )
-                return response
-            
-            except Exception as e:
-                error_str = str(e)
-                # Check for 503 or Overloaded
-                if "503" in error_str or "overloaded" in error_str.lower():
-                    print(f"[WARN] Gemini 503/Overloaded: {e}")
-                    
-                    if delay is not None:
-                        # Backoff
-                        print(f"[RETRY] Waiting {delay}s before retry...")
-                        time.sleep(delay)
-                        continue
-                    else:
-                        # Retries exhausted, try fallback if available
-                        if current_model in fallback_models:
-                            new_model = fallback_models[current_model]
-                            print(f"[FALLBACK] Retries failed. Switching model: {current_model} -> {new_model}")
-                            current_model = new_model
-                            # Try ONE more time with new model (or could loop again, but let's do one try)
-                            try:
-                                print(f"[DEBUG] Generating with fallback {current_model}")
-                                response = self.client.models.generate_content(
-                                    model=current_model,
-                                    contents=contents,
-                                    config=config
-                                )
-                                return response
-                            except Exception as e2:
-                                print(f"[ERROR] Fallback failed: {e2}")
-                                raise e2
-                        else:
-                            # No fallback available
-                            print(f"[ERROR] Retries exhausted, no fallback for {current_model}.")
-                            raise e
+                if is_transient and attempt < retries - 1:
+                    wait_time = delay * (2**attempt)
+                    logger.warning(
+                        "Transient API error on model=%s (%s). Retrying in %.1fs (attempt %d/%d)...",
+                        model,
+                        error_str[:160],
+                        wait_time,
+                        attempt + 1,
+                        retries,
+                    )
+                    time.sleep(wait_time)
                 else:
-                    # Non-retriable error (e.g. 400, 403)
-                    raise e
+                    raise
 
-    def _copy_image_to_clipboard_native(self, image_path: str):
-        """Copies an image at the given path to the Windows clipboard using ctypes."""
+    def _load_audio_part(self, audio_path: str) -> Tuple[types.Part, int]:
+        """Read an audio file from disk and wrap it in a `types.Part`."""
+        with open(audio_path, "rb") as f:
+            audio_bytes = f.read()
+        part = types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav")
+        return part, len(audio_bytes)
+
+    def _load_image_part(self, image_path: Optional[str]) -> Tuple[Optional[types.Part], int]:
+        """Read an optional screenshot PNG from disk and wrap it in a `types.Part`."""
+        if not image_path or not os.path.exists(image_path):
+            return None, 0
         try:
-            image = Image.open(image_path)
-            output = BytesIO()
-            # Convert to RGB to ensure compatibility
-            image.convert("RGB").save(output, "BMP")
-            data = output.getvalue()[14:]  # Remove the 14-byte BMP header to get DIB
-            output.close()
+            with open(image_path, "rb") as f:
+                image_bytes = f.read()
+            part = types.Part.from_bytes(data=image_bytes, mime_type="image/png")
+            return part, len(image_bytes)
+        except OSError as exc:
+            logger.warning("Failed to load screenshot at %s: %s", image_path, exc)
+            return None, 0
 
-            # Define clipboard constants
-            CF_DIB = 8
-            GMEM_MOVEABLE = 0x0002
-            
-            user32 = ctypes.windll.user32
-            kernel32 = ctypes.windll.kernel32
-            
-            # Open Clipboard
-            if not user32.OpenClipboard(0):
-               raise Exception("Could not open clipboard")
-               
-            try:
-                user32.EmptyClipboard()
-                
-                # Allocate global memory
-                h_global = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
-                if not h_global:
-                    raise Exception("GlobalAlloc failed")
-                
-                # Lock memory and copy data
-                ptr = kernel32.GlobalLock(h_global)
-                if not ptr:
-                     kernel32.GlobalFree(h_global)
-                     raise Exception("GlobalLock failed")
-                     
-                ctypes.memmove(ptr, data, len(data))
-                kernel32.GlobalUnlock(h_global)
-                
-                # Set clipboard data
-                if not user32.SetClipboardData(CF_DIB, h_global):
-                     kernel32.GlobalFree(h_global) # Free if set failed? Actually system owns it if Set succeeds
-                     raise Exception("SetClipboardData failed")
-                     
-            finally:
-                user32.CloseClipboard()
-                
-            print("[INFO] Native Copy to Clipboard success.")
-            
-        except Exception as e:
-            print(f"[ERROR] Native Clipboard Copy failed: {e}")
-            raise e
+    def _transcribe_with_asr_model(
+        self,
+        model_name: str,
+        audio_part: types.Part,
+        audio_size: int,
+        window_title: Optional[str],
+        mode_label: str = "dictation",
+    ) -> str:
+        """Execute a transcription call using a `transcribe`-family ASR model.
 
-    def process_audio(self, audio_path: str, image_path: str = None, window_title: str = None, mode: str = "dictation") -> str:
-        """Uploads audio/image bytes and gets the response text."""
-        if mode == "thinking":
-            return self._process_thinking_mode(audio_path, image_path, window_title)
+        Configures `AudioTranscriptionConfig` (`SMART` or `VERBATIM` + dynamic
+        window vocabulary) and extracts `part.audio_transcription.text`.
 
-        print(f"Envoi des données à Gemini... (Mode: {mode}, Audio: {audio_path}, Image: {image_path})")
-        
-        contents = []
-        
-        # 0. Define Prompts based on mode
-        if mode == "thinking":
-            # Reflection/Contextual mode
-            system_instruction = (
-                "Tu es un expert en communication contextuelle et un développeur senior. "
-                "Ta mission est de générer du contenu qui s'intègre PARFAITEMENT dans l'application ouverte devant l'utilisateur. "
-                "\n\n"
-                "RÈGLES D'ANALYSE VISUELLE CRITIQUES :"
-                "1. **FOCUS VISUEL (RÈGLE SUPRÊME)** :"
-                "   - Regarde OÙ est le curseur (cercle ROUGE semi-transparent)."
-                "   - L'application active est CELLE SOUS LE CURSEUR. Ignore les autres fenêtres en arrière-plan."
-                "   - Le texte pertinent est celui à proximité immédiate du curseur."
-                "\n"
-                "2. **Détecte la Langue du Contexte (PRIORITÉ ABSOLUE)** :"
-                "   - Regarde le texte DÉJÀ PRÉSENT sous le curseur."
-                "   - Si le contexte est en ANGLAIS -> TU DOIS RÉPONDRE EN ANGLAIS."
-                "\n"
-                "3. **Identifie la Structure** :"
-                "   - Chat vs Email vs Code : Déduit-le de la zone pointée par le curseur."
-                "\n"
-                "4. **Identifie l'Application** :"
-                "   - **IDE** : Si le curseur est dans le code -> Code pur. Si dans le chat -> Conversation."
-                "   - **Email/Messagerie** : Adapte le ton."
-                "\n"
-                "5. **Pas de Bavardage** : Envoie UNIQUEMENT le texte final à taper."
+        Args:
+            model_name: Transcribe model ID (e.g., `gemini-3.5-transcribe`).
+            audio_part: `types.Part` containing WAV audio bytes.
+            audio_size: Size of the audio payload in bytes.
+            window_title: Active window title for custom vocabulary extraction.
+            mode_label: Mode label for logging ('dictation', 'thinking-step0', etc.).
+
+        Returns:
+            Cleaned transcript string.
+        """
+        transcribe_cfg_dict = build_transcribe_config_dict(
+            window_title=window_title,
+            transcribe_mode=self.transcribe_mode,
+            user_vocabulary=self.custom_vocabulary,
+            language_codes=self.language_codes,
+        )
+
+        if hasattr(types, "AudioTranscriptionConfig"):
+            gen_config: Any = types.GenerateContentConfig(
+                audio_transcription_config=types.AudioTranscriptionConfig(
+                    **transcribe_cfg_dict
+                )
             )
-            prompt_text = "Instructions: Regarde SOUS le curseur rouge, analyse le contexte (app, langue) et exécute ma demande."
-        elif mode == "debug":
-            # Debug/Analysis mode
-            system_instruction = (
-                "Tu es un diagnostiqueur visuel. "
-                "Ta tâche est de DÉCRIRE ce qui se passe SOUS LE CURSEUR ROUGE. "
-                "1. Quelle application est directement sous le curseur ? "
-                "2. Quel texte lis-tu PROCHE du curseur ? "
-                "3. Le curseur pointe-t-il sur du code, un champ texte, ou un bouton ?"
-                "4. Ignore les fenêtres en arrière-plan."
-            )
-            prompt_text = "Instructions: Focus sur le cercle rouge. Décris le contexte immédiat."
         else:
-            # Dictation mode (Default)
-            # We strictly reinforce the "Don't chat" rule here
-            system_instruction = (
-                "Tu es un moteur de dictée pur. "
-                "TA SEULE ET UNIQUE TÂCHE est de transcrire ce que dit l'utilisateur pour qu'il puisse l'insérer dans un document. "
-                "RÈGLES CRITIQUES :\n"
-                "1. Si l'utilisateur donne une instruction de formatage ou de langue (ex: 'écris en anglais', 'traduis ça'), NE L'ÉCRIS PAS. APPLIQUE-LA.\n"
-                "2. Ne dis JAMAIS 'Voici le texte', 'D'accord', ou 'Bien sûr'.\n"
-                "3. N'ajoute pas de guillemets au début ou à la fin.\n"
-                "4. Si l'utilisateur hésite (euh...), ignore les hésitations.\n"
-                "5. Le texte final doit être prêt à être collé."
-                "\n6. Je vais te fournir des captures d'écran pour t'aider à comprendre le contexte (quelle app est utilisée, dans quelle langue est la discussion actuelle, comment s'écrivent certains termes etc). C'est juste du contexte.\n"
-                "7. Ne recopie pas ce qui est dans la capture d'écran, c'est ce qui est dit à l'oral qui est important."
-            )
-            prompt_text = (
-                "Instructions: Écoute l'audio et tape exactement le texte."
-#                "\nIMPORTANT: Priorise l'audio sur le texte visible à l'écran. N'utilise le contexte visuel que pour les noms propres ou références ambigües."
-            )
+            gen_config = {"audio_transcription_config": transcribe_cfg_dict}
 
-        # 1. Add Text Context
-        if window_title:
-            prompt_text += f"\nContexte Fenêtre: '{window_title}'."
-        if image_path:
-            prompt_text += "\nContexte Visuel: Une capture d'écran est fournie pour le contexte."
-            
-        # 0. Construct List - ORDER MATTERS for Gemini Focus
-        # We put Audio FIRST to prioritize listening in Dictation Mode
-        if audio_path and os.path.exists(audio_path):
+        log_llm_request(
+            logger=logger,
+            model_name=model_name,
+            model_family=FAMILY_TRANSCRIBE,
+            mode=mode_label,
+            config_summary={"audio_transcription_config": transcribe_cfg_dict},
+            prompt_text=None,
+            system_instruction=None,
+            media_summary=[f"audio/wav ({audio_size} bytes)"],
+        )
+
+        t0 = time.perf_counter()
+        response = self._generate_with_retry(
+            model=model_name,
+            contents=[audio_part],
+            config=gen_config,
+        )
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+        raw_text = extract_text_from_response(response)
+        cleaned_text = clean_transcription_output(raw_text)
+
+        log_llm_response(
+            logger=logger,
+            model_name=model_name,
+            model_family=FAMILY_TRANSCRIBE,
+            mode=mode_label,
+            elapsed_ms=elapsed_ms,
+            response_text=cleaned_text,
+            extra_info=f"raw_chars={len(raw_text)}",
+        )
+        return cleaned_text
+
+    def _dictate_with_multimodal_family(
+        self,
+        model_name: str,
+        audio_part: types.Part,
+        audio_size: int,
+        image_part: Optional[types.Part],
+        image_size: int,
+        window_title: Optional[str],
+    ) -> str:
+        """Execute context-aware dictation using a Gemini 2.5, 3.x Flash, or Pro model.
+
+        Selects the family-specific prompt template and thinking configuration.
+
+        Args:
+            model_name: Multimodal Gemini model ID.
+            audio_part: WAV audio part.
+            audio_size: Audio size in bytes.
+            image_part: Optional PNG screenshot part with cursor highlight.
+            image_size: Image size in bytes.
+            window_title: Title of the active application window.
+
+        Returns:
+            Cleaned text output ready to paste.
+        """
+        spec = get_model_spec(model_name)
+        family = spec.family
+
+        system_instruction, user_prompt = build_dictation_prompts_by_family(
+            model_family=family,
+            window_title=window_title,
+            has_image=image_part is not None,
+        )
+
+        contents: List[Any] = [audio_part]
+        if user_prompt:
+            contents.append(user_prompt)
+        if image_part is not None:
+            contents.append(image_part)
+
+        config_kwargs: Dict[str, Any] = {
+            "system_instruction": system_instruction,
+            "temperature": 0.0,
+        }
+        config_summary: Dict[str, Any] = {"temperature": 0.0}
+
+        if spec.default_thinking_level and hasattr(types, "ThinkingConfig"):
+            config_kwargs["thinking_config"] = types.ThinkingConfig(
+                thinking_level=spec.default_thinking_level
+            )
+            config_summary["thinking_level"] = spec.default_thinking_level
+
+        gen_config = types.GenerateContentConfig(**config_kwargs)
+
+        media_summary = [f"audio/wav ({audio_size} bytes)"]
+        if image_part is not None:
+            media_summary.append(f"image/png ({image_size} bytes)")
+
+        log_llm_request(
+            logger=logger,
+            model_name=model_name,
+            model_family=family,
+            mode="dictation",
+            config_summary=config_summary,
+            prompt_text=user_prompt,
+            system_instruction=system_instruction,
+            media_summary=media_summary,
+        )
+
+        t0 = time.perf_counter()
+        response = self._generate_with_retry(
+            model=model_name,
+            contents=contents,
+            config=gen_config,
+        )
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+        raw_text = extract_text_from_response(response)
+        cleaned_text = clean_transcription_output(raw_text)
+
+        log_llm_response(
+            logger=logger,
+            model_name=model_name,
+            model_family=family,
+            mode="dictation",
+            elapsed_ms=elapsed_ms,
+            response_text=cleaned_text,
+            extra_info=f"raw_chars={len(raw_text)}",
+        )
+        return cleaned_text
+
+    def process_audio(
+        self,
+        audio_path: str,
+        image_path: Optional[str] = None,
+        window_title: Optional[str] = None,
+        mode: str = "dictation",
+    ) -> Optional[str]:
+        """Process recorded audio according to the requested mode and active model family.
+
+        Args:
+            audio_path: Path to the recorded WAV file.
+            image_path: Optional path to the active monitor screenshot PNG.
+            window_title: Optional title of the currently focused window.
+            mode: One of 'dictation' (`F8`), 'thinking' (`F9`), or 'debug' (`Ctrl+F9`).
+
+        Returns:
+            Text to be pasted (or `"IMAGE_COPIED_TO_CLIPBOARD"` if an image was
+            generated in Thinking mode, or `None` on empty/error).
+        """
+        if not os.path.exists(audio_path):
+            logger.error("Audio file not found: %s", audio_path)
+            return None
+
+        try:
             with open(audio_path, "rb") as f:
                 audio_bytes = f.read()
-            contents.append(types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav"))
-            print("[INFO] Audio file added to contents.")
+            audio_size = len(audio_bytes)
+            audio_part = types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav")
 
-        # Then Text Prompt
-        contents.append(prompt_text)
+            image_part, image_size = self._load_image_part(image_path)
+            active_family = self.get_active_family()
 
-        # Finally Image (so text doesn't get buried)
-        # RESTORING IMAGE with logic constraints:
-        # We lowered resolution to 'LOW' in config to discourage OCR heavy lifting vs Audio
-        if image_path and os.path.exists(image_path):
+            if mode == "dictation":
+                if active_family == FAMILY_TRANSCRIBE:
+                    return self._transcribe_with_asr_model(
+                        model_name=self.model_name,
+                        audio_part=audio_part,
+                        audio_size=audio_size,
+                        window_title=window_title,
+                        mode_label="dictation",
+                    )
+                return self._dictate_with_multimodal_family(
+                    model_name=self.model_name,
+                    audio_part=audio_part,
+                    audio_size=audio_size,
+                    image_part=image_part,
+                    image_size=image_size,
+                    window_title=window_title,
+                )
+
+            if mode == "thinking":
+                return self._process_thinking_mode(
+                    audio_part=audio_part,
+                    audio_size=audio_size,
+                    image_part=image_part,
+                    image_size=image_size,
+                    window_title=window_title,
+                )
+
+            if mode == "debug":
+                return self._process_debug_mode(
+                    audio_part=audio_part,
+                    audio_size=audio_size,
+                    image_part=image_part,
+                    image_size=image_size,
+                    window_title=window_title,
+                )
+
+            logger.error("Unsupported processing mode: %s", mode)
+            return None
+
+        except Exception as exc:
+            logger.exception("Error processing audio in mode=%s: %s", mode, exc)
+            return None
+
+    def _process_thinking_mode(
+        self,
+        audio_part: types.Part,
+        audio_size: int,
+        image_part: Optional[types.Part],
+        image_size: int,
+        window_title: Optional[str],
+    ) -> Optional[str]:
+        """Handle 2-step Thinking Mode (`F9`): intent routing + text/image generation.
+
+        If the active dictation model is in the `transcribe` family, first runs
+        `gemini-3.5-transcribe` to obtain a high-accuracy transcript of the spoken
+        command, then supplies that transcript alongside the audio and screenshot
+        to the reasoning model (`self.thinking_model`).
+        """
+        transcribed_command: Optional[str] = None
+        if self.get_active_family() == FAMILY_TRANSCRIBE:
             try:
-                with open(image_path, "rb") as f:
-                    image_bytes = f.read()
-                contents.append(types.Part.from_bytes(data=image_bytes, mime_type="image/png"))
-            except Exception as e:
-                print(f"[WARN] Impossible de lire l'image: {e}")
+                transcribed_command = self._transcribe_with_asr_model(
+                    model_name=self.model_name,
+                    audio_part=audio_part,
+                    audio_size=audio_size,
+                    window_title=window_title,
+                    mode_label="thinking-transcribe",
+                )
+            except Exception as exc:
+                logger.warning("Pre-transcription in thinking mode failed, continuing with audio: %s", exc)
 
-        # Logging
-        print("\n--- [REQUEST SENT TO MODEL] ---")
-        print(f"Model: {self.model_name} | Mode: {mode}")
-        for item in contents:
-            if isinstance(item, str):
-                print(f"Text: {item}")
-            elif hasattr(item, 'mime_type'):
-                print(f"Data Part: {item.mime_type} ({len(item.data)} bytes)")
-        print("-------------------------------\n")
-        
-        # Generate
+        router_sys, router_prompt = build_thinking_router_prompt(
+            window_title=window_title,
+            transcribed_instruction=transcribed_command,
+        )
+
+        contents_step1: List[Any] = [audio_part, router_prompt]
+        media_summary = [f"audio/wav ({audio_size} bytes)"]
+        if image_part is not None:
+            contents_step1.append(image_part)
+            media_summary.append(f"image/png ({image_size} bytes)")
+
+        router_family = get_model_family(self.thinking_model)
+        step1_config = types.GenerateContentConfig(
+            system_instruction=router_sys,
+            response_mime_type="application/json",
+            temperature=0.2,
+        )
+
+        log_llm_request(
+            logger=logger,
+            model_name=self.thinking_model,
+            model_family=router_family,
+            mode="thinking-step1-router",
+            config_summary={"temperature": 0.2, "response_mime_type": "application/json"},
+            prompt_text=router_prompt,
+            system_instruction=router_sys,
+            media_summary=media_summary,
+        )
+
+        t0 = time.perf_counter()
+        response_step1 = self._generate_with_retry(
+            model=self.thinking_model,
+            contents=contents_step1,
+            config=step1_config,
+        )
+        elapsed_step1 = (time.perf_counter() - t0) * 1000.0
+        step1_text = extract_text_from_response(response_step1)
+
+        log_llm_response(
+            logger=logger,
+            model_name=self.thinking_model,
+            model_family=router_family,
+            mode="thinking-step1-router",
+            elapsed_ms=elapsed_step1,
+            response_text=step1_text,
+        )
+
+        try:
+            plan = json.loads(step1_text)
+            request_type = plan.get("type", "text")
+            refined_prompt = plan.get("refined_prompt", "")
+        except json.JSONDecodeError:
+            logger.warning("Failed to parse router JSON, falling back to raw text output.")
+            return clean_transcription_output(step1_text)
+
+        if request_type == "image":
+            return self._generate_thinking_image(refined_prompt)
+
+        # Step 2: Text / Code Drafting
+        draft_sys = (
+            "You are an expert writer and software engineer. Fulfill the user's "
+            "request directly. Output ONLY the requested text or code ready to "
+            "be pasted at the cursor, with no conversational intro or outro."
+        )
+        log_llm_request(
+            logger=logger,
+            model_name=self.thinking_model,
+            model_family=router_family,
+            mode="thinking-step2-draft",
+            config_summary={"temperature": 0.7},
+            prompt_text=refined_prompt,
+            system_instruction=draft_sys,
+            media_summary=[],
+        )
+
+        t1 = time.perf_counter()
+        response_step2 = self._generate_with_retry(
+            model=self.thinking_model,
+            contents=[refined_prompt],
+            config=types.GenerateContentConfig(
+                system_instruction=draft_sys,
+                temperature=0.7,
+            ),
+        )
+        elapsed_step2 = (time.perf_counter() - t1) * 1000.0
+        draft_text = clean_transcription_output(extract_text_from_response(response_step2))
+
+        log_llm_response(
+            logger=logger,
+            model_name=self.thinking_model,
+            model_family=router_family,
+            mode="thinking-step2-draft",
+            elapsed_ms=elapsed_step2,
+            response_text=draft_text,
+        )
+        return draft_text
+
+    def _generate_thinking_image(self, refined_prompt: str) -> str:
+        """Generate an image in Step 2 of Thinking Mode and copy it to the clipboard."""
+        image_family = get_model_family(self.image_model)
+        log_llm_request(
+            logger=logger,
+            model_name=self.image_model,
+            model_family=image_family,
+            mode="thinking-step2-image",
+            config_summary={},
+            prompt_text=refined_prompt,
+            system_instruction=None,
+            media_summary=[],
+        )
+
+        t0 = time.perf_counter()
         try:
             response = self._generate_with_retry(
-                model_name=self.model_name,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_instruction,
-                    temperature=0.0 if mode == "dictation" else 0.7, # Creative for thinking/debug, strict for dictation
-                )
+                model=self.image_model,
+                contents=[refined_prompt],
             )
-            
-            text_response = response.text.strip() if response.text else ""
-            print("\n--- [RESPONSE RECEIVED] ---")
-            print(text_response)
-            print("---------------------------\n")
-            return text_response
-            
-        except Exception as e:
-            # Better error logging
-            print(f"\n[ERROR GEMINI]: {e}")
-            if "API key expired" in str(e):
-                 print("!!! VOTRE CLÉ API EST EXPIRÉE OU INVALIDE. VEUILLEZ VÉRIFIER LE FICHIER .ENV !!!")
-            raise e
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
-    def _process_thinking_mode(self, audio_path: str, image_path: str, window_title: str) -> str:
-        """Executes the two-step thinking process: Analysis -> Drafting."""
-        print("\n=== [THINKING MODE STARTED] ===")
-        
-        # --- STEP 1: ANALYSIS ---
-        print(">> STEP 1: ANALYZING CONTEXT & INTENT...")
-        
-        analysis_system_instruction = (
-            "Tu es un expert en analyse de contexte et communication. "
-            "Ta mission est d'analyser la situation (écran, audio) pour préparer la réponse parfaite."
-            "\nNAVIGATEUR :"
-            "1. **Analyse Visuelle** : Regarde sous le curseur rouge. Quelle est l'app ? Quel est le ton ?"
-            "2. **Analyse Audio** : Que veut l'utilisateur ?"
-            "3. **Stratégie** : Détermine la langue, le ton (Pro/Perso), et les points clés."
-            "\n4. **ROUTING (CRITIQUE)** : Evalue la complexité."
-            "   - 'COMPLEX' : Code, Raisonnement logique complexe, Créativité longue, ou demande explicite de 'Pro'."
-            "   - 'SIMPLE' : Email rapide, chat, correction, courte phrase."
-            "   - 'IMAGE_GENERATION' : L'utilisateur demande explicitement de générer ou dessiner une image/graphique."
-            "\nSORTIE ATTENDUE :"
-            "Tu dois répondre UNIQUEMENT en JSON avec la structure suivante :"
-            "{"
-            "  \"context_analysis\": \"Analyse visuelle et contextuelle\","
-            "  \"intent\": \"Ce que veut l'utilisateur (Pour IMAGE_GENERATION: le prompt de l'image)\","
-            "  \"language\": \"Langue détectée (ex: 'fr', 'en')\","
-            "  \"tone\": \"Ton suggéré\","
-            "  \"complexity\": \"SIMPLE\" OU \"COMPLEX\" OU \"IMAGE_GENERATION\","
-            "  \"model_reasoning\": \"Pourquoi c'est simple, complexe ou une image\","
-            "  \"step_by_step_plan\": \"Plan de rédaction\""
-            "}"
-        )
-        
-        contents_step1 = []
-        prompt_text_1 = "Instructions: Analyse tout (Audio + Image) et donne-moi le plan de rédaction."
-        
-        if window_title:
-            prompt_text_1 += f"\nContexte Fenêtre: '{window_title}'."
-        
-        contents_step1.append(prompt_text_1)
-        
-        # Helper to load files safely
-        img_part = None
-        if image_path and os.path.exists(image_path):
+            candidates = getattr(response, "candidates", None) or []
+            for candidate in candidates:
+                content = getattr(candidate, "content", None)
+                for part in getattr(content, "parts", None) or []:
+                    inline_data = getattr(part, "inline_data", None)
+                    if inline_data and getattr(inline_data, "data", None):
+                        img_bytes = inline_data.data
+                        log_llm_response(
+                            logger=logger,
+                            model_name=self.image_model,
+                            model_family=image_family,
+                            mode="thinking-step2-image",
+                            elapsed_ms=elapsed_ms,
+                            response_text="<IMAGE_BYTES>",
+                            extra_info=f"image_bytes={len(img_bytes)}",
+                        )
+                        if self.dry_run:
+                            return "IMAGE_GENERATED_DRY_RUN"
+                        img = Image.open(io.BytesIO(img_bytes))
+                        if self._copy_image_to_clipboard_native(img):
+                            return "IMAGE_COPIED_TO_CLIPBOARD"
+                        return "Error: Failed to copy image to clipboard."
+
+            return "Error: No image data returned by image model."
+        except Exception as exc:
+            logger.exception("Image generation failed: %s", exc)
+            return f"Error generating image: {exc}"
+
+    def _process_debug_mode(
+        self,
+        audio_part: types.Part,
+        audio_size: int,
+        image_part: Optional[types.Part],
+        image_size: int,
+        window_title: Optional[str],
+    ) -> Optional[str]:
+        """Run Debug Mode (`Ctrl+F9`), combining ASR transcript + multimodal diagnostics."""
+        transcribed_text: Optional[str] = None
+        if self.get_active_family() == FAMILY_TRANSCRIBE:
             try:
-                with open(image_path, "rb") as f:
-                    img_part = types.Part.from_bytes(data=f.read(), mime_type="image/png")
-                    contents_step1.append(img_part)
-            except Exception as e:
-                print(f"[WARN] Failed to load image: {e}")
-
-        if audio_path and os.path.exists(audio_path):
-            try:
-                with open(audio_path, "rb") as f:
-                    audio_part = types.Part.from_bytes(data=f.read(), mime_type="audio/wav")
-                    contents_step1.append(audio_part)
-            except Exception as e:
-                 print(f"[WARN] Failed to load audio: {e}")
-
-        try:
-            response_1 = self._generate_with_retry(
-                model_name=self.model_name,
-                contents=contents_step1,
-                config=types.GenerateContentConfig(
-                    system_instruction=analysis_system_instruction,
-                    temperature=0.7,
-                    response_mime_type="application/json"
+                transcribed_text = self._transcribe_with_asr_model(
+                    model_name=self.model_name,
+                    audio_part=audio_part,
+                    audio_size=audio_size,
+                    window_title=window_title,
+                    mode_label="debug-transcribe",
                 )
-            )
-            analysis_text = response_1.text.strip() if response_1.text else "{}"
-            print(f"[STEP 1 RAW JSON]:\n{analysis_text}\n")
-            
-            # Parse JSON
-            try:
-                analysis_json = json.loads(analysis_text)
-            except json.JSONDecodeError:
-                print("[WARN] JSON Parsing failed, falling back to simple text analysis.")
-                analysis_json = {"complexity": "SIMPLE", "context_analysis": analysis_text}
+            except Exception as exc:
+                logger.warning("Debug mode pre-transcription failed: %s", exc)
 
-        except Exception as e:
-            print(f"[ERROR] Step 1 failed: {e}")
-            return ""
-
-        # --- STEP 2: DRAFTING ---
-        print(">> STEP 2: GENERATING FINAL TEXT...")
-        
-        drafting_system_instruction = (
-            "Tu es un rédacteur expert. "
-            "En te basant sur l'ANALYSE fournie et le contexte visuel, rédige le texte final."
-            "\nRÈGLES :"
-            "1. Respecte scrupuleusement le ton et la langue identifiés."
-            "2. Intègre-toi parfaitement au texte existant (sous le curseur)."
-            "3. SORTIE : UNIQUEMENT le texte à écrire. Pas de guillemets, pas de commentaires."
+        # Use the selected model if multimodal, otherwise use thinking_model for visual debug
+        diag_model = (
+            self.thinking_model
+            if self.get_active_family() == FAMILY_TRANSCRIBE
+            else self.model_name
         )
-        
-        contents_step2 = []
-        # Create a nice summary for the drafter
-        prompt_text_2 = (
-            f"CONTEXTE ANALYSÉ :\n{json.dumps(analysis_json, indent=2, ensure_ascii=False)}\n\n"
-            "Instructions: Rédige maintenant le texte final en suivant STRICTEMENT ce plan."
+        diag_family = get_model_family(diag_model)
+        debug_sys, debug_prompt = build_debug_prompt(
+            window_title=window_title,
+            transcribed_instruction=transcribed_text,
         )
-        
-        contents_step2.append(prompt_text_2)
-        # We include the image again for visual context/grounding in the drafting phase if available
-        if img_part: 
-            contents_step2.append(img_part)
-        
-        # Determine Model for Step 2
-        step2_model = self.model_name # Default to Lite
-        try:
-            complexity = analysis_json.get("complexity", "SIMPLE").upper()
-        except:
-            complexity = "SIMPLE"
-        
-        if complexity == "COMPLEX":
-            step2_model = "gemini-3-pro-preview"
-            print(f"[ROUTING] Task judged COMPLEX ({analysis_json.get('model_reasoning')}). Switching to {step2_model}.")
-        elif complexity == "IMAGE_GENERATION":
-             # New Image Mode
-             print(f"[ROUTING] Task judged IMAGE_GENERATION. Switching to Image Generation Flow.")
-             return self._generate_and_copy_image(analysis_json.get("intent")) # Use intent as prompt
-        else:
-            print(f"[ROUTING] Task judged SIMPLE. Staying on {step2_model}.")
 
+        contents: List[Any] = [audio_part, debug_prompt]
+        media_summary = [f"audio/wav ({audio_size} bytes)"]
+        if image_part is not None:
+            contents.append(image_part)
+            media_summary.append(f"image/png ({image_size} bytes)")
+
+        log_llm_request(
+            logger=logger,
+            model_name=diag_model,
+            model_family=diag_family,
+            mode="debug",
+            config_summary={"temperature": 0.4},
+            prompt_text=debug_prompt,
+            system_instruction=debug_sys,
+            media_summary=media_summary,
+        )
+
+        t0 = time.perf_counter()
+        response = self._generate_with_retry(
+            model=diag_model,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=debug_sys,
+                temperature=0.4,
+            ),
+        )
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        report = clean_transcription_output(extract_text_from_response(response))
+
+        log_llm_response(
+            logger=logger,
+            model_name=diag_model,
+            model_family=diag_family,
+            mode="debug",
+            elapsed_ms=elapsed_ms,
+            response_text=report,
+        )
+        return report
+
+    def _copy_image_to_clipboard_native(self, image: Image.Image) -> bool:
+        """Copy a PIL Image to the Windows clipboard via PowerShell."""
+        temp_path = os.path.abspath("temp_clipboard.png")
         try:
-            response_2 = self._generate_with_retry(
-                model_name=step2_model,
-                contents=contents_step2,
-                config=types.GenerateContentConfig(
-                    system_instruction=drafting_system_instruction,
-                    temperature=0.7
-                )
+            image.save(temp_path, "PNG")
+            ps_command = (
+                f"Add-Type -AssemblyName System.Windows.Forms; "
+                f"Add-Type -AssemblyName System.Drawing; "
+                f"$img = [System.Drawing.Image]::FromFile('{temp_path}'); "
+                f"[System.Windows.Forms.Clipboard]::SetImage($img); "
+                f"$img.Dispose();"
             )
-            final_text = response_2.text.strip() if response_2.text else ""
-            print(f"[STEP 2 OUTPUT]:\n{final_text}\n")
-            print("=== [THINKING MODE COMPLETE] ===")
-            return final_text
-            
-        except Exception as e:
-            print(f"[ERROR] Step 2 failed: {e}")
-            return ""
-
-    def _generate_and_copy_image(self, prompt: str) -> str:
-        """Generates an image using Gemini and copies it to the clipboard using native ctypes."""
-        print(f"\n>> GENERATING IMAGE for prompt: '{prompt}'...")
-        
-        try:
-            # 1. Generate Image
-            response = self._generate_with_retry(
-                model_name="gemini-3-pro-image-preview",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_modalities=['Image'],
-                    tools=[{"google_search": {}}] # Enable search for grounding (weather, etc)
-                )
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            subprocess.run(
+                ["powershell", "-Command", ps_command],
+                check=True,
+                creationflags=creationflags,
             )
-            
-            # 2. Extract and Save Image
-            image_saved = False
-            temp_path = None
-            
-            for part in response.parts:
-                if image := part.as_image():
-                     # Create temp file
-                     fd, temp_path = tempfile.mkstemp(suffix=".png")
-                     os.close(fd)
-                     image.save(temp_path)
-                     print(f"[INFO] Image saved to {temp_path}")
-                     image_saved = True
-                     break
-            
-            if not image_saved:
-                print("[ERROR] No image returned by Gemini.")
-                return ""
+            logger.info("Copied generated image to Windows clipboard via PowerShell.")
+            return True
+        except Exception as exc:
+            logger.error("Failed to copy image to clipboard: %s", exc)
+            return False
+        finally:
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
 
-            # 3. Copy to Clipboard (Native Code)
-            print("[INFO] Copying to clipboard (Native)...")
-            self._copy_image_to_clipboard_native(temp_path)
-            
-            return "___IMAGE_GENERATED___"
-
-        except Exception as e:
-            print(f"[ERROR] Image Generation failed: {e}")
-            return ""

@@ -1,113 +1,141 @@
-import sounddevice as sd
-import numpy as np
-import scipy.io.wavfile as wav
-import tempfile
+"""
+Microphone audio recorder for Dictating-app.
+
+Records 44.1 kHz 16-bit mono PCM WAV audio using `sounddevice` and `scipy.io.wavfile`,
+and enumerates physical MME input devices for the system tray microphone selector.
+"""
+
+import logging
 import os
+import wave
+from typing import Dict, List, Optional
+
+import numpy as np
+
+try:
+    from scipy.io.wavfile import write as scipy_wav_write
+except ImportError:
+    scipy_wav_write = None  # type: ignore
+
+logger = logging.getLogger("dictating_app")
+
+try:
+    import sounddevice as sd
+except Exception:
+    sd = None  # type: ignore
+
 
 class AudioRecorder:
-    def __init__(self, fs=44100, channels=1):
-        self.fs = fs
-        self.channels = channels
-        self.recording = []
+    """Streams microphone input into a local WAV file."""
+
+    def __init__(
+        self,
+        filename: str = "temp_recording.wav",
+        sample_rate: int = 44100,
+    ) -> None:
+        """Initialize the audio recorder.
+
+        Args:
+            filename: Output WAV filename for recorded audio.
+            sample_rate: Audio sampling rate in Hz (default 44100).
+        """
+        self.filename = filename
+        self.sample_rate = sample_rate
+        self.recording: bool = False
+        self.audio_data: List[np.ndarray] = []
         self.stream = None
+        self.device_index: Optional[int] = None
 
-    def list_devices(self):
-        """Returns a filtered list of unique input devices (id, name)."""
-        devices = sd.query_devices()
-        input_devices = []
-        seen_names = set()
-        
-        # Common system-generated names to ignore (English/French/Generic)
-        ignored_names = [
-            "Microsoft Sound Mapper", "Mappeur de sons Microsoft",
-            "Primary Sound Capture Driver", "Pilote de capture audio principal",
-            "Stereo Mix", "Mixage stéréo"
-        ]
-
-        for i, dev in enumerate(devices):
-            name = dev['name']
-            if dev['max_input_channels'] > 0:
-                # 1. Ignore specific Windows system wrappers
-                is_ignored = False
-                for ignored in ignored_names:
-                    if name.startswith(ignored):
-                        is_ignored = True
-                        break
-                if is_ignored:
-                    continue
-                
-                # 2. Deduplicate names (keep first occurrence)
-                if name not in seen_names:
-                    input_devices.append((i, name))
-                    seen_names.add(name)
-        
-        return input_devices
-
-    def start(self, device_index=None):
-        """Starts recording audio from the specified or default microphone."""
-        self.recording = [] # Reset recording
+    @staticmethod
+    def get_input_devices() -> Dict[int, str]:
+        """Return a mapping of `{device_index: device_name}` for MME input devices."""
+        devices_dict: Dict[int, str] = {}
+        if sd is None:
+            return devices_dict
         try:
-            self.stream = sd.InputStream(
-                device=device_index,
-                samplerate=self.fs, 
-                channels=self.channels, 
-                callback=self._callback
-            )
-            self.stream.start()
-            print(f"Enregistrement démarré (Device ID: {device_index})...")
-        except Exception as e:
-            print(f"[ERROR] Impossible de démarrer l'enregistrement sur le device {device_index}: {e}")
-            # Fallback to default if specific fails
-            if device_index is not None:
-                print("Tentative avec le périphérique par défaut...")
-                self.start(device_index=None)
+            devices = sd.query_devices()
+            hostapis = sd.query_hostapis()
 
-    def stop(self) -> str:
-        """Stops recording and saves to a temporary WAV file. Returns the file path."""
-        if self.stream:
+            mme_index = 0
+            for idx, api in enumerate(hostapis):
+                if "MME" in api.get("name", ""):
+                    mme_index = idx
+                    break
+
+            for idx, dev in enumerate(devices):
+                if dev.get("max_input_channels", 0) > 0 and dev.get("hostapi") == mme_index:
+                    name = dev.get("name", f"Device {idx}")
+                    if "Mappeur de sons" not in name and "Sound Mapper" not in name:
+                        devices_dict[idx] = name
+        except Exception as exc:
+            logger.warning("Error querying audio input devices: %s", exc)
+        return devices_dict
+
+    def set_device(self, index: int) -> None:
+        """Select the active microphone device index."""
+        self.device_index = index
+        logger.info("AudioRecorder device set to index=%s", index)
+
+    def _callback(self, indata: np.ndarray, frames: int, time_info: object, status: object) -> None:
+        """Sounddevice stream callback accumulating recorded audio frames."""
+        if status:
+            logger.debug("AudioStream status: %s", status)
+        if self.recording:
+            self.audio_data.append(indata.copy())
+
+    def start_recording(self) -> None:
+        """Begin capturing audio from the selected microphone."""
+        if self.recording or sd is None:
+            return
+        self.recording = True
+        self.audio_data = []
+        self.stream = sd.InputStream(
+            samplerate=self.sample_rate,
+            channels=1,
+            dtype="int16",
+            device=self.device_index,
+            callback=self._callback,
+        )
+        self.stream.start()
+        logger.info(
+            "Started audio recording (sample_rate=%d, device=%s)",
+            self.sample_rate,
+            self.device_index,
+        )
+
+    def stop_recording(self) -> Optional[str]:
+        """Stop capturing audio and write the buffered frames to a WAV file.
+
+        Returns:
+            Absolute path to the written WAV file, or `None` if no audio was recorded.
+        """
+        if not self.recording:
+            return None
+        self.recording = False
+        if self.stream is not None:
             self.stream.stop()
             self.stream.close()
             self.stream = None
-        
-        print("[RECORDER] Stopping stream...")
-        
-        if not self.recording:
-            print("[RECORDER] Warn: No data recorded (list is empty).")
+
+        if not self.audio_data:
+            logger.warning("No audio frames captured during recording.")
             return None
 
-        # Concatenate all blocks
-        try:
-            myrecording = np.concatenate(self.recording, axis=0)
-        except ValueError:
-            print("[RECORDER] Error: Concatenation failed (empty chunks?)")
-            return None
-            
-        # Stats
-        total_samples = len(myrecording)
-        duration_sec = total_samples / self.fs
-        max_amp = np.max(np.abs(myrecording)) if total_samples > 0 else 0
-        
-        print(f"[RECORDER] Stats: Duration={duration_sec:.2f}s, Samples={total_samples}, MaxAmp={max_amp:.4f}")
-        
-        if max_amp < 0.001:
-            print("[RECORDER] WARNING: Audio is essentially SILENT.")
-        
-        # Convert to int16 to ensure standard PCM WAV format (more compatible)
-        myrecording = (myrecording * 32767).astype(np.int16)
-        
-        # Create a temp file
-        fd, path = tempfile.mkstemp(suffix=".wav")
-        os.close(fd)
-        
-        # Save WAV
-        wav.write(path, self.fs, myrecording)
-        file_size = os.path.getsize(path)
-        print(f"[RECORDER] File saved: {path} ({file_size} bytes)")
-        
-        return path
-
-    def _callback(self, indata, frames, time, status):
-        """Callback for sounddevice."""
-        if status:
-            print(status)
-        self.recording.append(indata.copy())
+        audio_concatenated = np.concatenate(self.audio_data, axis=0)
+        abs_path = os.path.abspath(self.filename)
+        if scipy_wav_write is not None:
+            scipy_wav_write(abs_path, self.sample_rate, audio_concatenated)
+        else:
+            with wave.open(abs_path, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(self.sample_rate)
+                wf.writeframes(audio_concatenated.astype(np.int16).tobytes())
+        duration_sec = len(audio_concatenated) / float(self.sample_rate)
+        logger.info(
+            "Stopped recording -> saved %s (duration=%.2fs, bytes=%d)",
+            abs_path,
+            duration_sec,
+            os.path.getsize(abs_path),
+        )
+        return abs_path
