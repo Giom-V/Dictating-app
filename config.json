@@ -1,1 +1,9 @@
-{"microphone": "Microphone (Insta360 Link 2C)"}
+{
+  "microphone": "Microphone (Insta360 Link 2C)",
+  "model_name": "gemini-3.5-transcribe",
+  "transcribe_mode": "SMART",
+  "thinking_model": "gemini-3.1-pro-preview",
+  "image_model": "gemini-3-pro-image-preview",
+  "custom_vocabulary": [],
+  "language_codes": []
+}
